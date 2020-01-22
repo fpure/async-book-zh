@@ -157,21 +157,36 @@
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/06_02_join/src/lib.rs:naiive}}
+</span>async fn get_book_and_music() -&gt; (Book, Music) {
+    let book = get_book().await;
+    let music = get_music().await;
+    (book, music)
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>但是，这还是比所要的速度慢，因为它不会在<code>get_book</code>已经完成之后，开始尝试<code>get_music</code>。在其他一些语言中， Future 是环境运行到完成，因此可以，先调用每个<code>async fn</code>，来开始 futures，这样两个操作就是同时运行的，然后就是等待两个：</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/06_02_join/src/lib.rs:other_langs}}
+</span>// WRONG -- don't do this
+async fn get_book_and_music() -&gt; (Book, Music) {
+    let book_future = get_book();
+    let music_future = get_music();
+    (book_future.await, music_future.await)
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>但是，Rust Futures 在处于<code>.await</code>ed 之前不会做任何工作。这意味着，上面的两个代码片段，都将连续运行<code>book_future</code>和<code>music_future</code>，而不是同时运行它们。要同时正确运行两个 Future ，请使用<code>futures::join!</code>：</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/06_02_join/src/lib.rs:join}}
+</span>use futures::join;
+
+async fn get_book_and_music() -&gt; (Book, Music) {
+    let book_fut = get_book();
+    let music_fut = get_music();
+    join!(book_fut, music_fut)
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p><code>join!</code>传回的值，是一个元组，包含每个传递进去的<code>Future</code>的输出。</p>
@@ -181,14 +196,35 @@
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/06_02_join/src/lib.rs:try_join}}
+</span>use futures::try_join;
+
+async fn get_book() -&gt; Result&lt;Book, String&gt; { /* ... */ Ok(Book) }
+async fn get_music() -&gt; Result&lt;Music, String&gt; { /* ... */ Ok(Music) }
+
+async fn get_book_and_music() -&gt; Result&lt;(Book, Music), String&gt; {
+    let book_fut = get_book();
+    let music_fut = get_music();
+    try_join!(book_fut, music_fut)
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>请注意， 传递给<code>try_join!</code>的 Futures 必须都具有相同的错误类型。考虑使用<code>futures::future::TryFutureExt</code>中的<code>.map_err(|e| ...)</code>和<code>.err_into()</code>函数，来合并错误类型：</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/06_02_join/src/lib.rs:try_join_map_err}}
+</span>use futures::{
+    future::TryFutureExt,
+    try_join,
+};
+
+async fn get_book() -&gt; Result&lt;Book, ()&gt; { /* ... */ Ok(Book) }
+async fn get_music() -&gt; Result&lt;Music, String&gt; { /* ... */ Ok(Music) }
+
+async fn get_book_and_music() -&gt; Result&lt;(Book, Music), String&gt; {
+    let book_fut = get_book().map_err(|()| &quot;Unable to get book&quot;.to_string());
+    let music_fut = get_music();
+    try_join!(book_fut, music_fut)
+}
 <span class="boring">}
 </span></code></pre></pre>
 

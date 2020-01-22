@@ -151,19 +151,50 @@
                 <div id="content" class="content">
                     <main>
                         <h1><a class="header" href="#iteration-and-concurrency" id="iteration-and-concurrency">Iteration and Concurrency</a></h1>
-<p>类似于同步  方式的<code>Iterator</code>，这里有很多不同的方法可以迭代和处理一个<code>Stream</code>中的值。有组合器样式的方法，例如<code>map</code>，<code>filter</code>和<code>fold</code>和他们的有错误就早退的表弟<code>try_map</code>，<code>try_filter</code>和<code>try_fold</code>。</p>
+<p>类似于同步方式的<code>Iterator</code>，这里有很多不同的方法可以迭代和处理一个<code>Stream</code>中的值。有组合器样式的方法，例如<code>map</code>，<code>filter</code>和<code>fold</code>和他们的有错误就早退的表弟<code>try_map</code>，<code>try_filter</code>和<code>try_fold</code>。</p>
 <p>不幸，<code>for</code>循环不适用于<code>Stream</code>s，但对于命令式代码，<code>while let</code>和<code>next</code>/<code>try_next</code>函数可以这样用：</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/05_02_iteration_and_concurrency/src/lib.rs:nexts}}
+</span>async fn sum_with_next(mut stream: Pin&lt;&amp;mut dyn Stream&lt;Item = i32&gt;&gt;) -&gt; i32 {
+    use futures::stream::StreamExt; // for `next`
+    let mut sum = 0;
+    while let Some(item) = stream.next().await {
+        sum += item;
+    }
+    sum
+}
+
+async fn sum_with_try_next(
+    mut stream: Pin&lt;&amp;mut dyn Stream&lt;Item = Result&lt;i32, io::Error&gt;&gt;&gt;,
+) -&gt; Result&lt;i32, io::Error&gt; {
+    use futures::stream::TryStreamExt; // for `try_next`
+    let mut sum = 0;
+    while let Some(item) = stream.try_next().await? {
+        sum += item;
+    }
+    Ok(sum)
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>但是，如果我们一次只处理一个元素，则可能会失去了并发的机会，这毕竟这是我们要编写异步代码的首要原因。要同时处理一个 stream 中的多个 items，请使用<code>for_each_concurrent</code>和<code>try_for_each_concurrent</code>方法：</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/05_02_iteration_and_concurrency/src/lib.rs:try_for_each_concurrent}}
+</span>async fn jump_around(
+    mut stream: Pin&lt;&amp;mut dyn Stream&lt;Item = Result&lt;u8, io::Error&gt;&gt;&gt;,
+) -&gt; Result&lt;(), io::Error&gt; {
+    use futures::stream::TryStreamExt; // for `try_for_each_concurrent`
+    const MAX_CONCURRENT_JUMPERS: usize = 100;
+
+    stream.try_for_each_concurrent(MAX_CONCURRENT_JUMPERS, |num| async move {
+        jump_n_times(num).await?;
+        report_n_jumps(num).await?;
+        Ok(())
+    }).await?;
+
+    Ok(())
+}
 <span class="boring">}
 </span></code></pre></pre>
 

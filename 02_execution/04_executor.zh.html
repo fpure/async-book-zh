@@ -168,7 +168,21 @@ futures-preview = &quot;=0.3.0-alpha.17&quot;
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_04_executor/src/lib.rs:imports}}
+</span>use {
+    futures::{
+        future::{FutureExt, BoxFuture},
+        task::{ArcWake, waker_ref},
+    },
+    std::{
+        future::Future,
+        sync::{Arc, Mutex},
+        sync::mpsc::{sync_channel, SyncSender, Receiver},
+        task::{Context, Poll},
+        time::Duration,
+    },
+    // The timer we wrote in the previous section:
+    timer_future::TimerFuture,
+};
 <span class="boring">}
 </span></code></pre></pre>
 <p>我们的 executor 的工作是，将通过发送任务，在通道上运行。executor 将事件从通道中拉出，并运行它们。当一个任务准备做更多的工作（被唤醒）时，它可以安排自己重新回到通道上，以计划再次进行轮询。</p>
@@ -176,37 +190,122 @@ futures-preview = &quot;=0.3.0-alpha.17&quot;
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_04_executor/src/lib.rs:executor_decl}}
+</span>/// Task executor that receives tasks off of a channel and runs them.
+struct Executor {
+    ready_queue: Receiver&lt;Arc&lt;Task&gt;&gt;,
+}
+
+/// `Spawner` spawns new futures onto the task channel.
+#[derive(Clone)]
+struct Spawner {
+    task_sender: SyncSender&lt;Arc&lt;Task&gt;&gt;,
+}
+
+/// A future that can reschedule itself to be polled by an `Executor`.
+struct Task {
+    /// In-progress future that should be pushed to completion.
+    ///
+    /// The `Mutex` is not necessary for correctness, since we only have
+    /// one thread executing tasks at once. However, Rust isn't smart
+    /// enough to know that `future` is only mutated from one thread,
+    /// so we need use the `Mutex` to prove thread-safety. A production
+    /// executor would not need this, and could use `UnsafeCell` instead.
+    future: Mutex&lt;Option&lt;BoxFuture&lt;'static, ()&gt;&gt;&gt;,
+
+    /// Handle to place the task itself back onto the task queue.
+    task_sender: SyncSender&lt;Arc&lt;Task&gt;&gt;,
+}
+
+fn new_executor_and_spawner() -&gt; (Executor, Spawner) {
+    // Maximum number of tasks to allow queueing in the channel at once.
+    // This is just to make `sync_channel` happy, and wouldn't be present in
+    // a real executor.
+    const MAX_QUEUED_TASKS: usize = 10_000;
+    let (task_sender, ready_queue) = sync_channel(MAX_QUEUED_TASKS);
+    (Executor { ready_queue }, Spawner { task_sender })
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>我们还向 spawner 添加一种方法，以使其易于生成新的 Future 。此方法将拿到一个 Future 类型，将其装箱，并放入 FutureObj 中，然后创建一个新类型<code>Arc&lt;Task&gt;</code>，它的内部可以在 executor 上，排队。</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_04_executor/src/lib.rs:spawn_fn}}
+</span>impl Spawner {
+    fn spawn(&amp;self, future: impl Future&lt;Output = ()&gt; + 'static + Send) {
+        let future = future.boxed();
+        let task = Arc::new(Task {
+            future: Mutex::new(Some(future)),
+            task_sender: self.task_sender.clone(),
+        });
+        self.task_sender.send(task).expect(&quot;too many tasks queued&quot;);
+    }
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>要轮询 Future ，我们需要创建一个<code>Waker</code>。正如在<a href="./03_wakeups.zh.html">唤醒章节</a>，<code>Waker</code>负责安排，一旦<code>wake</code>调用了，就再次轮询的任务。记住，<code>Waker</code>s 是会告诉 executor，确切的那些任务已经准备就绪，只轮询准备好前进的 Future。创建一个新的<code>Waker</code>最简单的方法是，通过实现<code>ArcWake</code> trait ，然后使用<code>waker_ref</code>要么<code>.into_waker()</code>函数，将<code>Arc&lt;impl ArcWake&gt;</code>转变成一个<code>Waker</code>。让我们，为我们的任务实现<code>ArcWake</code>，这样就可以转变为<code>Waker</code>，和被唤醒啦：</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_04_executor/src/lib.rs:arcwake_for_task}}
+</span>impl ArcWake for Task {
+    fn wake_by_ref(arc_self: &amp;Arc&lt;Self&gt;) {
+        // Implement `wake` by sending this task back onto the task channel
+        // so that it will be polled again by the executor.
+        let cloned = arc_self.clone();
+        arc_self.task_sender.send(cloned).expect(&quot;too many tasks queued&quot;);
+    }
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>当一个新建的<code>Waker</code>，从<code>Arc&lt;Task&gt;</code>而来，那么我们在它上面调用<code>wake()</code>，将导致<code>Arc</code>的一个 copy 发送到任务通道。然后，我们的 executor 需要选择任务，并进行轮询。让我们实现一下：</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_04_executor/src/lib.rs:executor_run}}
+</span>impl Executor {
+    fn run(&amp;self) {
+        while let Ok(task) = self.ready_queue.recv() {
+            // Take the future, and if it has not yet completed (is still Some),
+            // poll it in an attempt to complete it.
+            let mut future_slot = task.future.lock().unwrap();
+            if let Some(mut future) = future_slot.take() {
+                // Create a `LocalWaker` from the task itself
+                let waker = waker_ref(&amp;task);
+                let context = &amp;mut Context::from_waker(&amp;*waker);
+                // `BoxFuture&lt;T&gt;` is a type alias for
+                // `Pin&lt;Box&lt;dyn Future&lt;Output = T&gt; + Send + 'static&gt;&gt;`.
+                // We can get a `Pin&lt;&amp;mut dyn Future + Send + 'static&gt;`
+                // from it by calling the `Pin::as_mut` method.
+                if let Poll::Pending = future.as_mut().poll(context) {
+                    // We're not done processing the future, so put it
+                    // back in its task to be run again in the future.
+                    *future_slot = Some(future);
+                }
+            }
+        }
+    }
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>恭喜你！我们现在有一个能工作的 Future executor。我们甚至可以使用它，来运行<code>async/.await</code>代码和自定义 Future ，例如，我们之前写过的<code>TimerFuture</code>：</p>
-<pre><pre class="playpen"><code class="language-rust">
-<span class="boring">#![allow(unused_variables)]
-</span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_04_executor/src/lib.rs:main}}
-<span class="boring">}
-</span></code></pre></pre>
+<pre><pre class="playpen"><code class="language-rust">fn main() {
+    let (executor, spawner) = new_executor_and_spawner();
+
+    // Spawn a task to print before and after waiting on a timer.
+    spawner.spawn(async {
+        println!(&quot;howdy!&quot;);
+        // Wait for our timer future to complete after two seconds.
+        TimerFuture::new(Duration::new(2, 0)).await;
+        println!(&quot;done!&quot;);
+    });
+
+    // Drop the spawner so that our executor knows it is finished and won't
+    // receive more incoming tasks to run.
+    drop(spawner);
+
+    // Run the executor until the task queue is empty.
+    // This will print &quot;howdy!&quot;, pause, and then print &quot;done!&quot;.
+    executor.run();
+}
+</code></pre></pre>
 
                     </main>
 

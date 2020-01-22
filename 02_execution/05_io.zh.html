@@ -155,7 +155,29 @@
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_02_future_trait/src/lib.rs:socket_read}}
+</span>pub struct SocketRead&lt;'a&gt; {
+    socket: &amp;'a Socket,
+}
+
+impl SimpleFuture for SocketRead&lt;'_&gt; {
+    type Output = Vec&lt;u8&gt;;
+
+    fn poll(&amp;mut self, wake: fn()) -&gt; Poll&lt;Self::Output&gt; {
+        if self.socket.has_data_to_read() {
+            // The socket has data-- read it into a buffer and return it.
+            Poll::Ready(self.socket.read_buf())
+        } else {
+            // The socket does not yet have data.
+            //
+            // Arrange for `wake` to be called once data is available.
+            // When data becomes available, `wake` will be called, and the
+            // user of this `Future` will know to call `poll` again and
+            // receive data.
+            self.socket.set_readable_callback(wake);
+            Poll::Pending
+        }
+    }
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>这个 Future 将读取套接字上的可用数据，如果没有可用数据，它将交还给 executor，要求在套接字再次变得可读时，唤醒这个任务。但是，根据此示例尚不清楚，这个<code>Socket</code>类型是怎么实现的，尤其是<code>set_readable_callback</code>函数是如何工作的。我们如何安排<code>lw.wake()</code>，在一旦套接字变得可读时，就被调用？一种选择是，让一个线程不断检查<code>socket</code>是否可读，在适当的时候调用<code>wake()</code>。但是，这将是非常低效的，需要为每个阻塞的 IO Future 使用一个单独的线程。这将大大降低我们异步代码的效率。</p>

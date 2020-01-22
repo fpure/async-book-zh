@@ -155,7 +155,15 @@
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_02_future_trait/src/lib.rs:simple_future}}
+</span>trait SimpleFuture {
+    type Output;
+    fn poll(&amp;mut self, wake: fn()) -&gt; Poll&lt;Self::Output&gt;;
+}
+
+enum Poll&lt;T&gt; {
+    Ready(T),
+    Pending,
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>Future 可以通过调用<code>poll</code>函数，推动 Future，让其尽可能接近完成。如果 Future 完成，它将返回<code>Poll::Ready(result)</code>。如果 Future 还不能完成，它将返回<code>Poll::Pending</code>，并安排<code>wake()</code>在<code>Future</code>准备进一步的时候，调用。当<code>wake()</code>调用，executor 驱使 <code>Future</code>，再次调用<code>poll</code>，这样<code>Future</code>就离完成再进一步了。</p>
@@ -165,28 +173,131 @@
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_02_future_trait/src/lib.rs:socket_read}}
+</span>pub struct SocketRead&lt;'a&gt; {
+    socket: &amp;'a Socket,
+}
+
+impl SimpleFuture for SocketRead&lt;'_&gt; {
+    type Output = Vec&lt;u8&gt;;
+
+    fn poll(&amp;mut self, wake: fn()) -&gt; Poll&lt;Self::Output&gt; {
+        if self.socket.has_data_to_read() {
+            // The socket has data-- read it into a buffer and return it.
+            Poll::Ready(self.socket.read_buf())
+        } else {
+            // The socket does not yet have data.
+            //
+            // Arrange for `wake` to be called once data is available.
+            // When data becomes available, `wake` will be called, and the
+            // user of this `Future` will know to call `poll` again and
+            // receive data.
+            self.socket.set_readable_callback(wake);
+            Poll::Pending
+        }
+    }
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>这个<code>Future</code>s 模型可以将多个异步操作组合在一起，而无需中间分配。一次运行多个 Future 或将 Future 链接在一起，可以通过无分配状态机来实现，如下所示：</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_02_future_trait/src/lib.rs:join}}
+</span>/// A SimpleFuture that runs two other futures to completion concurrently.
+///
+/// Concurrency is achieved via the fact that calls to `poll` each future
+/// may be interleaved, allowing each future to advance itself at its own pace.
+pub struct Join&lt;FutureA, FutureB&gt; {
+    // Each field may contain a future that should be run to completion.
+    // If the future has already completed, the field is set to `None`.
+    // This prevents us from polling a future after it has completed, which
+    // would violate the contract of the `Future` trait.
+    a: Option&lt;FutureA&gt;,
+    b: Option&lt;FutureB&gt;,
+}
+
+impl&lt;FutureA, FutureB&gt; SimpleFuture for Join&lt;FutureA, FutureB&gt;
+where
+    FutureA: SimpleFuture&lt;Output = ()&gt;,
+    FutureB: SimpleFuture&lt;Output = ()&gt;,
+{
+    type Output = ();
+    fn poll(&amp;mut self, wake: fn()) -&gt; Poll&lt;Self::Output&gt; {
+        // Attempt to complete future `a`.
+        if let Some(a) = &amp;mut self.a {
+            if let Poll::Ready(()) = a.poll(wake) {
+                self.a.take();
+            }
+        }
+
+        // Attempt to complete future `b`.
+        if let Some(b) = &amp;mut self.b {
+            if let Poll::Ready(()) = b.poll(wake) {
+                self.b.take();
+            }
+        }
+
+        if self.a.is_none() &amp;&amp; self.b.is_none() {
+            // Both futures have completed-- we can return successfully
+            Poll::Ready(())
+        } else {
+            // One or both futures returned `Poll::Pending` and still have
+            // work to do. They will call `wake()` when progress can be made.
+            Poll::Pending
+        }
+    }
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>这显示了，如何在无需单独分配的情况下，同时运行多个 Future ，从而可以实现更高效的异步程序。同样，可以依次运行多个有序 Future ，如下所示：</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_02_future_trait/src/lib.rs:and_then}}
+</span>/// A SimpleFuture that runs two futures to completion, one after another.
+//
+// Note: for the purposes of this simple example, `AndThenFut` assumes both
+// the first and second futures are available at creation-time. The real
+// `AndThen` combinator allows creating the second future based on the output
+// of the first future, like `get_breakfast.and_then(|food| eat(food))`.
+pub struct AndThenFut&lt;FutureA, FutureB&gt; {
+    first: Option&lt;FutureA&gt;,
+    second: FutureB,
+}
+
+impl&lt;FutureA, FutureB&gt; SimpleFuture for AndThenFut&lt;FutureA, FutureB&gt;
+where
+    FutureA: SimpleFuture&lt;Output = ()&gt;,
+    FutureB: SimpleFuture&lt;Output = ()&gt;,
+{
+    type Output = ();
+    fn poll(&amp;mut self, wake: fn()) -&gt; Poll&lt;Self::Output&gt; {
+        if let Some(first) = &amp;mut self.first {
+            match first.poll(wake) {
+                // We've completed the first future-- remove it and start on
+                // the second!
+                Poll::Ready(()) =&gt; self.first.take(),
+                // We couldn't yet complete the first future.
+                Poll::Pending =&gt; return Poll::Pending,
+            };
+        }
+        // Now that the first future is done, attempt to complete the second.
+        self.second.poll(wake)
+    }
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>这些示例说明了<code>Future</code>trait 可用于表示异步控制流，而无需多个分配的对象，和深层嵌套的回调。随着基本控制流程的发展，让我们谈谈真正的<code>Future</code> trait 及其不同之处。</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_02_future_trait/src/lib.rs:real_future}}
+</span>trait Future {
+    type Output;
+    fn poll(
+        // Note the change from `&amp;mut self` to `Pin&lt;&amp;mut Self&gt;`:
+        self: Pin&lt;&amp;mut Self&gt;,
+        // and the change from `wake: fn()` to `cx: &amp;mut Context&lt;'_&gt;`:
+        cx: &amp;mut Context&lt;'_&gt;,
+    ) -&gt; Poll&lt;Self::Output&gt;;
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>您会注意到的第一个变化是<code>self</code>类型，不再<code>&amp;mut self</code>，而更改为<code>Pin&lt;&amp;mut Self&gt;</code>。我们将详细讨论 pinning 在<a href="../04_pinning/01_chapter.zh.html">稍后章节</a>，但现在知道它使我们能够创建 Immovable(无法移动) 的 Future 。无法移动的对象可以在其字段之间存储指针，例如<code>struct MyFut { a: i32, ptr_to_a: *const i32 }</code>。Pinning 是启用 async/await 所必需的。</p>

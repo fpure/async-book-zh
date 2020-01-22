@@ -162,21 +162,68 @@
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_03_timer/src/lib.rs:imports}}
+</span>use {
+    std::{
+        future::Future,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll, Waker},
+        thread,
+        time::Duration,
+    },
+};
 <span class="boring">}
 </span></code></pre></pre>
 <p>让我们从定义 future 类型本身开始。我们的 future 需要一种方法，来让线程可以传达，timer elapsed 和 这个 future 应该完成的信息。我们将使用一个<code>Arc&lt;Mutex&lt;..&gt;&gt;</code>共享值，在线程和 Future 之间进行通信。</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_03_timer/src/lib.rs:timer_decl}}
+</span>pub struct TimerFuture {
+    shared_state: Arc&lt;Mutex&lt;SharedState&gt;&gt;,
+}
+
+/// Shared state between the future and the waiting thread
+struct SharedState {
+    /// Whether or not the sleep time has elapsed
+    completed: bool,
+
+    /// The waker for the task that `TimerFuture` is running on.
+    /// The thread can use this after setting `completed = true` to tell
+    /// `TimerFuture`'s task to wake up, see that `completed = true`, and
+    /// move forward.
+    waker: Option&lt;Waker&gt;,
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>现在，让我们实际编写<code>Future</code>实现！</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_03_timer/src/lib.rs:future_for_timer}}
+</span>impl Future for TimerFuture {
+    type Output = ();
+    fn poll(self: Pin&lt;&amp;mut Self&gt;, cx: &amp;mut Context&lt;'_&gt;) -&gt; Poll&lt;Self::Output&gt; {
+        // Look at the shared state to see if the timer has already completed.
+        let mut shared_state = self.shared_state.lock().unwrap();
+        if shared_state.completed {
+            Poll::Ready(())
+        } else {
+            // Set waker so that the thread can wake up the current task
+            // when the timer has completed, ensuring that the future is polled
+            // again and sees that `completed = true`.
+            //
+            // It's tempting to do this once rather than repeatedly cloning
+            // the waker each time. However, the `TimerFuture` can move between
+            // tasks on the executor, which could cause a stale waker pointing
+            // to the wrong task, preventing `TimerFuture` from waking up
+            // correctly.
+            //
+            // N.B. it's possible to check for this using the `Waker::will_wake`
+            // function, but we omit that here to keep things simple.
+            shared_state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>很简单，对吧？如果线程设置了<code>shared_state.completed = true</code>，我们就搞定了！不然的话，我们会为当前任务，clone <code>Waker</code>，并将其传递给<code>shared_state.waker</code>，这样线程才能唤醒备份的任务。</p>
@@ -185,7 +232,31 @@
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/02_03_timer/src/lib.rs:timer_new}}
+</span>impl TimerFuture {
+    /// Create a new `TimerFuture` which will complete after the provided
+    /// timeout.
+    pub fn new(duration: Duration) -&gt; Self {
+        let shared_state = Arc::new(Mutex::new(SharedState {
+            completed: false,
+            waker: None,
+        }));
+
+        // Spawn the new thread
+        let thread_shared_state = shared_state.clone();
+        thread::spawn(move || {
+            thread::sleep(duration);
+            let mut shared_state = thread_shared_state.lock().unwrap();
+            // Signal that the timer has completed and wake up the last
+            // task on which the future was polled, if one exists.
+            shared_state.completed = true;
+            if let Some(waker) = shared_state.waker.take() {
+                waker.wake()
+            }
+        });
+
+        TimerFuture { shared_state }
+    }
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>Woot！这就是我们构建一个简单的计时器 future 的全部。现在，如果我们只有一个 executor，来运行 future ...</p>

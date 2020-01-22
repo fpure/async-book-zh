@@ -156,14 +156,30 @@
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/01_02_why_async/src/lib.rs:get_two_sites}}
+</span>fn get_two_sites() {
+    // Spawn two threads to do work.
+    let thread_one = thread::spawn(|| download(&quot;https://www.foo.com&quot;));
+    let thread_two = thread::spawn(|| download(&quot;https://www.bar.com&quot;));
+
+    // Wait for both threads to complete.
+    thread_one.join().expect(&quot;thread one panicked&quot;);
+    thread_two.join().expect(&quot;thread two panicked&quot;);
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>这对许多应用程序都很好用 —— 毕竟，线程被设计为可以做到这一点：一次运行多个不同的任务。但是，它们也有一些限制。在不同线程之间切换，以及在线程之间共享数据的过程，涉及很多开销。即使只是一个坐着不执行任何操作的线程，也会占用宝贵的系统资源。这些就是异步代码旨在消除的成本。我们可以使用 Rust <code>async</code>/<code>.await</code>符号，重写上面的函数，这将使我们能够一次运行多个任务，而无需创建多个线程：</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/01_02_why_async/src/lib.rs:get_two_sites_async}}
+</span>async fn get_two_sites_async() {
+    // Create two different &quot;futures&quot; which, when run to completion,
+    // will asynchronously download the webpages.
+    let future_one = download_async(&quot;https://www.foo.com&quot;);
+    let future_two = download_async(&quot;https://www.bar.com&quot;);
+
+    // Run both futures to completion at the same time.
+    join!(future_one, future_two);
+}
 <span class="boring">}
 </span></code></pre></pre>
 <p>总体而言，与相应的线程实现相比，异步应用程序可能具有更快的速度和更少的资源。但是，这是有成本的。线程受操作系统的原生支持，并且使用它们不需要任何特殊的编程模型 —— 任何函数都可以创建一个线程，且调用那些使用线程的函数，通常与调用任何普通函数一样容易。但是，异步功能需要语言或库的特殊支持。在 Rust 中，<code>async fn</code>创建一个异步函数，该函数返回一个<code>Future</code>。要执行该函数的主体（比如：网络 API 的数据），返回的<code>Future</code>，必须运行（实际请求）到完成。</p>

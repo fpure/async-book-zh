@@ -154,22 +154,93 @@
 <p>让我们用<code>async</code>/<code>.await</code>建立一个回声服务器！</p>
 <p>开始之前，运行<code>rustup update stable</code>，以确保你有 stable Rust 1.39 或更新的版本。一旦完成，就<code>cargo new async-await-echo</code>创建新项目，并打开输出的<code>async-await-echo</code>文件夹。</p>
 <p>让我们将一些依赖项，添加到<code>Cargo.toml</code>文件：</p>
-<pre><code class="language-toml">{{#include ../../examples/01_05_http_server/Cargo.toml:9:18}}
+<pre><code class="language-toml">[dependencies]
+# The latest version of the &quot;futures&quot; library, which has lots of utilities
+# for writing async code. Enable the &quot;compat&quot; feature to include the
+# functions for using futures 0.3 and async/await with the Hyper library,
+# which use futures 0.1.
+futures = { version = &quot;0.3&quot;, features = [&quot;compat&quot;] }
+
+# Hyper is an asynchronous HTTP library. We'll use it to power our HTTP
+# server and to make HTTP requests.
+hyper = &quot;0.12.9&quot;
 </code></pre>
 <p>既然我们已经摆脱了依赖关系，让我们开始编写一些代码。我们有一些 imports 要添加：</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/01_05_http_server/src/lib.rs:imports}}
+</span>use {
+    hyper::{
+        // Miscellaneous types from Hyper for working with HTTP.
+        Body, Client, Request, Response, Server, Uri,
+
+        // This function turns a closure which returns a future into an
+        // implementation of the the Hyper `Service` trait, which is an
+        // asynchronous function from a generic `Request` to a `Response`.
+        service::service_fn,
+
+        // A function which runs a future to completion using the Hyper runtime.
+        rt::run,
+    },
+    futures::{
+        // Extension trait for futures 0.1 futures, adding the `.compat()` method
+        // which allows us to use `.await` on 0.1 futures.
+        compat::Future01CompatExt,
+        // Extension traits providing additional methods on futures.
+        // `FutureExt` adds methods that work for all futures, whereas
+        // `TryFutureExt` adds methods to futures that return `Result` types.
+        future::{FutureExt, TryFutureExt},
+    },
+    std::net::SocketAddr,
+};
 <span class="boring">}
 </span></code></pre></pre>
 <p>一旦搞定这些 imports，我们就可以开始整理样板文件，以便满足以下要求：</p>
-<pre><pre class="playpen"><code class="language-rust">
-<span class="boring">#![allow(unused_variables)]
-</span><span class="boring">fn main() {
-</span>{{#include ../../examples/01_05_http_server/src/lib.rs:boilerplate}}
-<span class="boring">}
-</span></code></pre></pre>
+<pre><pre class="playpen"><code class="language-rust">async fn serve_req(_req: Request&lt;Body&gt;) -&gt; Result&lt;Response&lt;Body&gt;, hyper::Error&gt; {
+    // Always return successfully with a response containing a body with
+    // a friendly greeting ;)
+    Ok(Response::new(Body::from(&quot;hello, world!&quot;)))
+}
+
+async fn run_server(addr: SocketAddr) {
+    println!(&quot;Listening on http://{}&quot;, addr);
+
+    // Create a server bound on the provided address
+    let serve_future = Server::bind(&amp;addr)
+        // Serve requests using our `async serve_req` function.
+        // `serve` takes a closure which returns a type implementing the
+        // `Service` trait. `service_fn` returns a value implementing the
+        // `Service` trait, and accepts a closure which goes from request
+        // to a future of the response. To use our `serve_req` function with
+        // Hyper, we have to box it and put it in a compatability
+        // wrapper to go from a futures 0.3 future (the kind returned by
+        // `async fn`) to a futures 0.1 future (the kind used by Hyper).
+        .serve(|| service_fn(|req| serve_req(req).boxed().compat()));
+
+    // Wait for the server to complete serving or exit with an error.
+    // If an error occurred, print it to stderr.
+    if let Err(e) = serve_future.compat().await {
+        eprintln!(&quot;server error: {}&quot;, e);
+    }
+}
+
+fn main() {
+    // Set the address to run our socket on.
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+
+    // Call our `run_server` function, which returns a future.
+    // As with every `async fn`, for `run_server` to do anything,
+    // the returned future needs to be run. Additionally,
+    // we need to convert the returned future from a futures 0.3 future into a
+    // futures 0.1 future.
+    let futures_03_future = run_server(addr);
+    let futures_01_future = futures_03_future.unit_error().boxed().compat();
+
+    // Finally, we can run the future to completion using the `run` function
+    // provided by Hyper.
+    run(futures_01_future);
+}
+</code></pre></pre>
 <p>如果你现在<code>cargo run</code>，你应该看到信息“Listening on http://127.0.0.1:3000“打印在你的终端上。如果你在你选择的浏览器中，打开这个网址，你会看到“hello, world!”出现在浏览器中。祝贺你！您刚刚在 Rust 中编写了，第一个异步 web 服务器。</p>
 <p>您还可以检查 request(请求) 本身，它包含诸如，request 的 URI、HTTP 版本、header 和其他元数据等信息。例如，我们可以打印出请求的 URI，如下所示：</p>
 <pre><pre class="playpen"><code class="language-rust">
@@ -183,14 +254,18 @@
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/01_05_http_server/src/lib.rs:parse_url}}
+</span>let url_str = &quot;http://www.rust-lang.org/en-US/&quot;;
+let url = url_str.parse::&lt;Uri&gt;().expect(&quot;failed to parse URL&quot;);
 <span class="boring">}
 </span></code></pre></pre>
 <p>然后，我们可以新建一个新的<code>hyper::Client</code>，并使用它，制造一个<code>GET</code>请求，将响应返回给用户：</p>
 <pre><pre class="playpen"><code class="language-rust">
 <span class="boring">#![allow(unused_variables)]
 </span><span class="boring">fn main() {
-</span>{{#include ../../examples/01_05_http_server/src/lib.rs:get_request}}
+</span>let res = Client::new().get(url).compat().await;
+// Return the result of the request directly to the user
+println!(&quot;request finished-- returning response&quot;);
+res
 <span class="boring">}
 </span></code></pre></pre>
 <p><code>Client::get</code>会返回一个<code>hyper::client::FutureResponse</code>，它实现了<code>Future&lt;Output = Result&lt;Response, Error&gt;&gt;</code>（或<code>Future&lt;Item = Response, Error = Error&gt;</code>在 futures 0.1 版）。当我们<code>.await</code>以后，会发送一个 HTTP 请求，挂起当前任务，并在响应可用时，任务会排队等待继续。</p>
